@@ -374,13 +374,13 @@ def render_pro_terminal():
 
         with top_col2:
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: [...]
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: #00FF00;'>₹{st.session_state.capital:,.0f}</span></div>",
                 unsafe_allow_html=True)
 
         with top_col3:
             pnl_color = '#00FF00' if st.session_state.realized_pnl > 0 else '#FF0000' if st.session_state.realized_pnl < 0 else 'gray'
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_[...]
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_color};'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
                 unsafe_allow_html=True)
 
         st.divider()
