@@ -3,3 +3,4 @@ pandas
 jugaad-data
 plotly
 streamlit-autorefresh
+bcrypt
