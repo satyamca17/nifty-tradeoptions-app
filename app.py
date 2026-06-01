@@ -144,7 +144,7 @@ def close_position(pos_id, exit_price, reason="Manual Square-off", qty_to_close=
         close_qty = qty_to_close if qty_to_close is not None else pos['Quantity']
         if close_qty > pos['Quantity']: close_qty = pos['Quantity']
         final_pnl = (exit_price - pos['Entry Price']) * close_qty if pos['Action'] == "Buy" else (pos[
-                                                                                                      'Entry Price'] - exit_price) * close_qty
+                                                                                                       'Entry Price'] - exit_price) * close_qty
         st.session_state.realized_pnl += final_pnl
         st.session_state.history.append({
             "Time Closed": datetime.now().strftime("%H:%M:%S"), "Action": pos['Action'],
@@ -374,13 +374,13 @@ def render_pro_terminal():
 
         with top_col2:
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: #1f77b4; font-weight: bold;'>₹{st.session_state.capital + st.session_state.realized_pnl:,.2f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: [...]
                 unsafe_allow_html=True)
 
         with top_col3:
             pnl_color = '#00FF00' if st.session_state.realized_pnl > 0 else '#FF0000' if st.session_state.realized_pnl < 0 else 'gray'
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_color}; font-weight: bold;'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_[...]
                 unsafe_allow_html=True)
 
         st.divider()
@@ -747,11 +747,3 @@ def render_pro_terminal():
                         "Chart assumes positions are held to expiry day. Max Profit/Loss are estimated based on a ±1000 point range.")
                 else:
                     st.info("Execute trades and fetch live data to view your payoff chart.")
-
-
-if __name__ == "__main__":
-    st.set_page_config(page_title="Options Pro Terminal", layout="wide", page_icon="📈")
-
-    # Simple check to call the render function
-    # I noticed your code didn't have the final call to run the app, so I've added it here.
-    render_pro_terminal()
