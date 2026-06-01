@@ -108,6 +108,9 @@ def render_signup_page():
 
 # --- Router ---
 def render_auth_page():
+    # Initialize the database once
+    init_db()
+    
     # Centering the radio buttons using columns
     col1, col2, col3 = st.columns([1, 1.5, 1])
     with col2:
@@ -117,17 +120,3 @@ def render_auth_page():
         render_login_page()
     else:
         render_signup_page()
-
-
-# --- Main ---
-# Initialize the database table structure
-init_db()
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    render_auth_page()
-else:
-    st.success(f"✅ You are logged in as {st.session_state.username}")
-    st.write("Here goes your main app content...")
