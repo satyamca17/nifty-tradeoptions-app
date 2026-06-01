@@ -1,6 +1,8 @@
 import streamlit as st
 import sys
 import traceback
+import login
+import app
 
 # Set page config here so it applies to the whole app layout
 st.set_page_config(page_title="Options Pro", page_icon="📈", layout="wide")
