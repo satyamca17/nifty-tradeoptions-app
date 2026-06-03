@@ -92,7 +92,7 @@ def render_signup_page():
             email = st.text_input("Email Address", key="signup_email")
             phone = st.text_input("Phone Number", key="signup_phone")
             pancard = st.text_input("PAN Card Number", key="signup_pan").upper()  # Force uppercase for PAN
-            password = st.text_input("Choose a Password", type="password", key="signup_pass")
+            password: str | None = st.text_input("Choose a Password", type="password", key="signup_pass")
 
             if st.button("Sign Up", type="primary", use_container_width=True):
                 # Basic validation to ensure no fields are empty
