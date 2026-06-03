@@ -1,21 +1,134 @@
 import streamlit as st
 import pandas as pd
 import uuid
+import sqlite3
 import plotly.graph_objects as go
+import json
 from datetime import datetime
 from jugaad_data.nse import NSELive
 from streamlit_autorefresh import st_autorefresh
 
 # --- CONFIG ---
+DB_PATH = "users.db"
 INDEX_CONFIG = {
-    "NIFTY": {"lot": 25, "step": 50},
-    "BANKNIFTY": {"lot": 15, "step": 100},
+    "NIFTY": {"lot": 65, "step": 50},
+    "BANKNIFTY": {"lot": 30, "step": 100},
     "FINNIFTY": {"lot": 40, "step": 50}
 }
 
 
 # ==========================================
-# LIVE NSE DATA FUNCTIONS (Global Scope)
+# DATABASE HELPER FUNCTIONS
+# ==========================================
+def load_user_data(username):
+    """Loads open positions, today's trade history, and watchlists from SQLite on startup."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # 1. Load open positions
+        cursor.execute("SELECT * FROM open_positions WHERE username = ?", (username,))
+        port_rows = cursor.fetchall()
+        portfolio = []
+        for row in port_rows:
+            portfolio.append({
+                "ID": row['id'], "Action": row['action'], "Strike": row['strike'],
+                "OptType": row['opt_type'], "Entry Price": row['entry_price'],
+                "Target": row['target'], "SL": row['sl'], "Quantity": row['quantity'],
+                "Live LTP": 0.0, "P&L": 0.0
+            })
+
+        # 2. Load TODAY'S trade history
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("SELECT * FROM trade_history WHERE username = ? AND trade_time LIKE ?",
+                       (username, f"{current_date}%"))
+
+        hist_rows = cursor.fetchall()
+        history = []
+        realized_pnl = 0.0
+        for row in hist_rows:
+            history.append({
+                "Time Closed": row['trade_time'], "Action": row['action'],
+                "Type": row['contract'], "Qty": row['qty'],
+                "Entry Price": round(row['entry_price'], 2), "Exit Price": round(row['exit_price'], 2),
+                "P&L": round(row['pnl'], 2), "Reason": row['reason']
+            })
+            realized_pnl += row['pnl']
+
+        # 3. Load Watchlists
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_prefs (username TEXT PRIMARY KEY, watchlists TEXT)''')
+        cursor.execute("SELECT watchlists FROM user_prefs WHERE username = ?", (username,))
+        pref_row = cursor.fetchone()
+
+        if pref_row and pref_row['watchlists']:
+            watchlists = json.loads(pref_row['watchlists'])
+        else:
+            watchlists = {"Watchlist 1": [], "Watchlist 2": [], "Watchlist 3": []}
+
+        conn.close()
+        return portfolio, history, realized_pnl, watchlists
+    except Exception as e:
+        return [], [], 0.0, {"Watchlist 1": [], "Watchlist 2": [], "Watchlist 3": []}
+
+
+def save_watchlists(username, watchlists_dict):
+    """Saves the user's current watchlists to the database."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    wl_json = json.dumps(watchlists_dict)
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS user_prefs (username TEXT PRIMARY KEY, watchlists TEXT)''')
+    cursor.execute('''
+        INSERT INTO user_prefs (username, watchlists) VALUES (?, ?)
+        ON CONFLICT(username) DO UPDATE SET watchlists = excluded.watchlists
+    ''', (username, wl_json))
+    conn.commit()
+    conn.close()
+
+
+def upsert_position(username, pos):
+    """Inserts a new position or updates an existing one."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO open_positions (id, username, action, strike, opt_type, entry_price, target, sl, quantity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            quantity = excluded.quantity,
+            entry_price = excluded.entry_price,
+            target = excluded.target,
+            sl = excluded.sl
+    ''', (pos['ID'], username, pos['Action'], pos['Strike'], pos['OptType'], pos['Entry Price'], pos['Target'],
+          pos['SL'], pos['Quantity']))
+    conn.commit()
+    conn.close()
+
+
+def delete_position(pos_id):
+    """Removes a position from the database once it is fully closed."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM open_positions WHERE id = ?", (pos_id,))
+    conn.commit()
+    conn.close()
+
+
+def insert_trade_history(username, action, contract, qty, entry_price, exit_price, pnl, reason):
+    """Logs a completed trade into the history table."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    trade_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('''
+        INSERT INTO trade_history (username, trade_time, action, contract, qty, entry_price, exit_price, pnl, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (username, trade_time, action, contract, qty, entry_price, exit_price, pnl, reason))
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# LIVE NSE DATA FUNCTIONS
 # ==========================================
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_nse_option_chain(symbol="NIFTY"):
@@ -35,32 +148,21 @@ def get_live_display_chain(symbol, selected_expiry=None):
     spot = records.get('underlyingValue', 0.0)
     data = records.get('data', [])
 
-    # 1. EXTRACT DATES SAFELY AND DEDUPLICATE
     unique_dates = []
     for row in data:
         ce = row.get('CE') or {}
         pe = row.get('PE') or {}
-
-        possible_dates = [
-            row.get('expiryDate'),
-            ce.get('expiryDate'),
-            pe.get('expiryDate')
-        ]
-
+        possible_dates = [row.get('expiryDate'), ce.get('expiryDate'), pe.get('expiryDate')]
         for d in possible_dates:
             if d:
-                # STRICTLY remove invisible spaces to prevent duplicate dropdown options
                 clean_d = str(d).strip()
                 if clean_d and clean_d not in unique_dates:
                     unique_dates.append(clean_d)
 
-    # Sort the dates chronologically for the dropdown UI
-        # Sort the dates chronologically for the dropdown UI
     try:
-            # Added dayfirst=True inside a lambda function to silence the warning and sort correctly
-            expiry_dates = sorted(unique_dates, key=lambda x: pd.to_datetime(x, dayfirst=True))
+        expiry_dates = sorted(unique_dates, key=lambda x: pd.to_datetime(x, dayfirst=True))
     except Exception:
-            expiry_dates = unique_dates
+        expiry_dates = unique_dates
 
     if not selected_expiry and expiry_dates:
         selected_expiry = expiry_dates[0]
@@ -69,30 +171,23 @@ def get_live_display_chain(symbol, selected_expiry=None):
     nearest_strike = int(round(spot / step) * step) if spot > 0 else 0
     lower = nearest_strike - (step * 30)
     upper = nearest_strike + (step * 30)
-
     display_data = []
-
-    # Clean the target exp for matching
     target_exp = str(selected_expiry).strip().lower()
 
     for row in data:
         ce = row.get('CE') or {}
         pe = row.get('PE') or {}
-
-        # Clean row dates for matching
         row_dates = [
             str(row.get('expiryDate', '')).strip().lower(),
             str(ce.get('expiryDate', '')).strip().lower(),
             str(pe.get('expiryDate', '')).strip().lower()
         ]
 
-        # 2. EXACT MATCH
         if target_exp in row_dates:
             try:
                 strike = float(row.get('strikePrice', 0))
             except (ValueError, TypeError):
                 continue
-
             if spot == 0 or (lower <= strike <= upper):
                 display_data.append({
                     "CE OI": int(ce.get('openInterest', 0) or 0),
@@ -107,6 +202,7 @@ def get_live_display_chain(symbol, selected_expiry=None):
     df = pd.DataFrame(display_data)
     return df, spot, expiry_dates
 
+
 def get_ltp_from_chain(chain_data, strike, opt_type):
     if not chain_data: return None
     for record in chain_data:
@@ -119,8 +215,26 @@ def get_ltp_from_chain(chain_data, strike, opt_type):
 
 
 def add_or_average_position(action, strike, opt_type, entry_price, target, sl, quantity, live_ltp):
+    username = st.session_state.get('username', 'guest')
+    opposite_action = "Sell" if action == "Buy" else "Buy"
+
+    # 1. Check for opposite position (Square off)
+    opposite_pos = next((p for p in st.session_state.portfolio if
+                         p['Action'] == opposite_action and p['Strike'] == strike and p['OptType'] == opt_type), None)
+
+    if opposite_pos:
+        if quantity <= opposite_pos['Quantity']:
+            close_position(opposite_pos['ID'], entry_price, reason="Auto Square-off", qty_to_close=quantity)
+            return
+        else:
+            remaining_qty = quantity - opposite_pos['Quantity']
+            close_position(opposite_pos['ID'], entry_price, reason="Auto Square-off (Reversal)")
+            quantity = remaining_qty
+
+    # 2. Normal average or add logic
     existing_pos = next((p for p in st.session_state.portfolio if
                          p['Action'] == action and p['Strike'] == strike and p['OptType'] == opt_type), None)
+
     if existing_pos:
         old_qty = existing_pos['Quantity']
         old_price = existing_pos['Entry Price']
@@ -130,46 +244,59 @@ def add_or_average_position(action, strike, opt_type, entry_price, target, sl, q
         if target > 0: existing_pos['Target'] = target
         if sl > 0: existing_pos['SL'] = sl
         existing_pos['Live LTP'] = live_ltp
+        upsert_position(username, existing_pos)
     else:
-        st.session_state.portfolio.append({
+        new_pos = {
             "ID": str(uuid.uuid4())[:8], "Action": action, "Strike": strike, "OptType": opt_type,
             "Entry Price": entry_price, "Target": target, "SL": sl, "Quantity": quantity,
             "Live LTP": live_ltp, "P&L": 0.0
-        })
+        }
+        st.session_state.portfolio.append(new_pos)
+        upsert_position(username, new_pos)
 
 
 def close_position(pos_id, exit_price, reason="Manual Square-off", qty_to_close=None):
+    username = st.session_state.get('username', 'guest')
     pos = next((p for p in st.session_state.portfolio if p['ID'] == pos_id), None)
+
     if pos:
         close_qty = qty_to_close if qty_to_close is not None else pos['Quantity']
         if close_qty > pos['Quantity']: close_qty = pos['Quantity']
+
         final_pnl = (exit_price - pos['Entry Price']) * close_qty if pos['Action'] == "Buy" else (pos[
-                                                                                                       'Entry Price'] - exit_price) * close_qty
+                                                                                                      'Entry Price'] - exit_price) * close_qty
+
+        # Update Session State
         st.session_state.realized_pnl += final_pnl
+        time_closed = datetime.now().strftime("%H:%M:%S")
+        contract_name = f"{pos['Strike']} {pos['OptType']}"
+
         st.session_state.history.append({
-            "Time Closed": datetime.now().strftime("%H:%M:%S"), "Action": pos['Action'],
-            "Type": f"{pos['Strike']} {pos['OptType']}", "Qty": close_qty,
+            "Time Closed": time_closed, "Action": pos['Action'],
+            "Type": contract_name, "Qty": close_qty,
             "Entry Price": round(pos['Entry Price'], 2), "Exit Price": round(exit_price, 2),
             "P&L": round(final_pnl, 2), "Reason": reason
         })
+
+        # Add to Trade History Database
+        insert_trade_history(username, pos['Action'], contract_name, close_qty, pos['Entry Price'], exit_price,
+                             final_pnl, reason)
+
+        # Handle full vs partial close
         if close_qty == pos['Quantity']:
             st.session_state.portfolio = [p for p in st.session_state.portfolio if p['ID'] != pos_id]
             st.session_state.pending_orders = [po for po in st.session_state.pending_orders if
                                                po.get('Pos_ID') != pos_id]
+            delete_position(pos_id)
         else:
             pos['Quantity'] -= close_qty
+            upsert_position(username, pos)
 
 
 # ==========================================
 # MAIN TERMINAL RENDER FUNCTION
 # ==========================================
 def render_pro_terminal():
-    # CSS: Moving app up, resizing metrics to heading sizes, fixing radio buttons
-    # ==========================================
-    # MAIN TERMINAL RENDER FUNCTION
-    # ==========================================
-
-        # CSS: Moving app up, resizing metrics to heading sizes, fixing radio buttons
     st.markdown("""
         <style>
         .block-container { padding-top: 1.5rem !important; }
@@ -181,34 +308,44 @@ def render_pro_terminal():
         </style>
         """, unsafe_allow_html=True)
 
-    # Initialize Core Session States
-    if 'portfolio' not in st.session_state: st.session_state.portfolio = []
-    if 'history' not in st.session_state: st.session_state.history = []
+    # DATABASE LOAD (Runs once per session)
+    if 'db_loaded' not in st.session_state:
+        username = st.session_state.get('username', 'guest')
+        port, hist, rpnl, wls = load_user_data(username)
+        st.session_state.portfolio = port
+        st.session_state.history = hist
+        st.session_state.realized_pnl = rpnl
+        st.session_state.watchlists = wls
+        st.session_state.db_loaded = True
+
+    # Initialize Standard Core Session States
     if 'pending_orders' not in st.session_state: st.session_state.pending_orders = []
     if 'exit_prompt_id' not in st.session_state: st.session_state.exit_prompt_id = None
     if 'edit_prompt_id' not in st.session_state: st.session_state.edit_prompt_id = None
     if 'capital' not in st.session_state: st.session_state.capital = 450000.0
-    if 'realized_pnl' not in st.session_state: st.session_state.realized_pnl = 0.0
 
-    if 'watchlists' not in st.session_state:
-        st.session_state.watchlists = {"Watchlist 1": [], "Watchlist 2": [], "Watchlist 3": []}
+    # CALLBACK FOR ONE-CLICK EXECUTION
+    def quick_execute(action, strike, opt_type, ltp, qty, contract_name, lots_count):
+        add_or_average_position(action, strike, opt_type, ltp, 0.0, 0.0, qty, ltp)
+        icon = "🟢" if action == "Buy" else "🔴"
+        st.toast(f"{icon} {action} {lots_count} Lot(s) of {contract_name} at Market!")
+        st.session_state.main_nav_radio = "⚡ Trade Terminal"
 
-    # Added Header and Logout Button
     h_col_title, h_col_logout = st.columns([9, 1])
     with h_col_title:
         st.markdown("<h2 style='text-align: center; margin-bottom: 5px;'>📈 Options Pro Terminal</h2>",
                     unsafe_allow_html=True)
     with h_col_logout:
-        st.write("")  # Just an empty space to push the button down slightly
+        st.write("")
         if st.button("Logout", type="secondary", use_container_width=True):
             st.session_state.authenticated = False
+            if 'db_loaded' in st.session_state: del st.session_state['db_loaded']
             st.rerun()
 
-    # Auto-Refresh and Navigation
     h_col1, h_col2, h_col3 = st.columns([1, 2, 1])
     with h_col2:
         page = st.radio("Navigation", ["📊 Market Watch", "⚡ Trade Terminal"], horizontal=True,
-                        label_visibility="collapsed")
+                        label_visibility="collapsed", key="main_nav_radio")
     with h_col3:
         st.write("")
         auto_refresh = st.checkbox("⏱️ Auto-Refresh (30s)", value=False)
@@ -220,7 +357,6 @@ def render_pro_terminal():
     # PAGE 1: MARKET WATCH
     # ==========================================
     if page == "📊 Market Watch":
-
         df_nifty, spot_nifty, exp_nifty = get_live_display_chain("NIFTY")
         df_bank, spot_bank, exp_bank = get_live_display_chain("BANKNIFTY")
         df_fin, spot_fin, exp_fin = get_live_display_chain("FINNIFTY")
@@ -231,12 +367,10 @@ def render_pro_terminal():
         m3.metric("NIFTY FINSRV", f"{spot_fin:.2f}")
 
         st.divider()
-
         col_wl, col_oc = st.columns([1.3, 1.7])
 
         with col_wl:
             st.markdown("### 📋 Watchlists")
-
             wl_names = list(st.session_state.watchlists.keys())
             if len(wl_names) < 5:
                 with st.expander("➕ Create New Watchlist"):
@@ -244,19 +378,18 @@ def render_pro_terminal():
                     if st.button("Create"):
                         if new_wl_name and new_wl_name not in wl_names:
                             st.session_state.watchlists[new_wl_name] = []
+                            save_watchlists(st.session_state.get('username', 'guest'), st.session_state.watchlists)
                             st.rerun()
                         elif new_wl_name in wl_names:
                             st.error("Watchlist name already exists.")
 
             if wl_names:
                 tabs = st.tabs(wl_names)
-
                 for idx, tab in enumerate(tabs):
                     current_wl = wl_names[idx]
                     with tab:
                         with st.container(border=True):
                             st.markdown(f"**Add to {current_wl}** (Max 50)")
-
                             c1, c2 = st.columns(2)
                             with c1:
                                 add_sym = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"],
@@ -284,10 +417,10 @@ def render_pro_terminal():
                                         contract_name = f"{add_sym} {add_strike} {add_type}"
                                         if not any(item["Contract"] == contract_name for item in
                                                    st.session_state.watchlists[current_wl]):
-                                            st.session_state.watchlists[current_wl].append({
-                                                "Contract": contract_name,
-                                                "LTP": 0.0
-                                            })
+                                            st.session_state.watchlists[current_wl].append(
+                                                {"Contract": contract_name, "LTP": 0.0})
+                                            save_watchlists(st.session_state.get('username', 'guest'),
+                                                            st.session_state.watchlists)
                                             st.rerun()
                                         else:
                                             st.toast("Contract already in watchlist!")
@@ -296,40 +429,88 @@ def render_pro_terminal():
 
                         wl_items = st.session_state.watchlists[current_wl]
                         if wl_items:
+                            # --- 1. EXPIRY AUTO-CLEANUP ---
+                            cleaned_items = []
+                            needs_save = False
+
                             for item in wl_items:
                                 parts = item["Contract"].split(" ")
-                                sym = parts[0]
-                                strike = int(parts[1])
-                                opt_type = parts[2]
-
+                                sym, strike, opt_type = parts[0], int(parts[1]), parts[2]
                                 records = fetch_nse_option_chain(sym)
+
+                                live_price = None
                                 if records and 'data' in records:
                                     live_price = get_ltp_from_chain(records['data'], strike, opt_type)
-                                    if live_price: item["LTP"] = live_price
 
-                            wl_df = pd.DataFrame(wl_items)
-                            st.dataframe(wl_df, width='stretch', hide_index=True)
+                                if live_price is not None:
+                                    item["LTP"] = live_price
+                                    cleaned_items.append(item)
+                                else:
+                                    needs_save = True
+
+                            if needs_save:
+                                st.session_state.watchlists[current_wl] = cleaned_items
+                                save_watchlists(st.session_state.get('username', 'guest'), st.session_state.watchlists)
+                                st.toast("🧹 Cleaned up expired contracts from Watchlist.")
+                                wl_items = cleaned_items
+
+                            # --- 2. RENDER INTERACTIVE LIST ---
+                            if wl_items:
+                                st.markdown("---")
+                                hc1, hc2, hc_lot, hc3, hc4 = st.columns([2.2, 1.0, 1.1, 1.2, 1.2])
+                                hc1.markdown("**Contract**")
+                                hc2.markdown("**LTP**")
+                                hc_lot.markdown("**Lots**")
+                                hc3.markdown("**Buy**")
+                                hc4.markdown("**Sell**")
+                                st.markdown("---")
+
+                                for item_idx, item in enumerate(wl_items):
+                                    cc1, cc2, cc_lot, cc3, cc4 = st.columns([2.2, 1.0, 1.1, 1.2, 1.2])
+
+                                    cc1.markdown(f"<div style='margin-top: 10px;'>{item['Contract']}</div>",
+                                                 unsafe_allow_html=True)
+                                    cc2.markdown(f"<div style='margin-top: 10px;'>₹{item['LTP']:.2f}</div>",
+                                                 unsafe_allow_html=True)
+
+                                    parts = item["Contract"].split(" ")
+                                    sym, strike, opt_type = parts[0], int(parts[1]), parts[2]
+                                    lot_size = INDEX_CONFIG[sym]["lot"]
+
+                                    num_lots = cc_lot.number_input("Lots", min_value=1, value=1, step=1,
+                                                                   key=f"lot_{current_wl}_{item_idx}",
+                                                                   label_visibility="collapsed")
+                                    trade_qty = num_lots * lot_size
+
+                                    # Used Streamlit callbacks to safely switch tabs!
+                                    cc3.button("Buy", key=f"buy_{current_wl}_{item_idx}", type="primary",
+                                               use_container_width=True, on_click=quick_execute,
+                                               args=("Buy", strike, opt_type, item["LTP"], trade_qty, item['Contract'],
+                                                     num_lots))
+
+                                    cc4.button("Sell", key=f"sell_{current_wl}_{item_idx}",
+                                               use_container_width=True, on_click=quick_execute,
+                                               args=("Sell", strike, opt_type, item["LTP"], trade_qty, item['Contract'],
+                                                     num_lots))
+                                st.markdown("---")
+
                             if st.button("Clear Watchlist", key=f"clr_{current_wl}"):
                                 st.session_state.watchlists[current_wl] = []
+                                save_watchlists(st.session_state.get('username', 'guest'), st.session_state.watchlists)
                                 st.rerun()
                         else:
                             st.info("Watchlist is empty. Add instruments above.")
 
             with col_oc:
                 st.markdown("### 🔗 Live Option Chains")
-                st.write("Real-time NSE Data: OI, Chg, LTP")
-
                 chain_tabs = st.tabs(["NIFTY", "BANKNIFTY", "FINNIFTY"])
 
                 def highlight_strike(s):
                     return ['background-color: #f0f2f6; font-weight: bold; color: black' if s.name == 'STRIKE' else ''
                             for v in s]
 
-                # REMOVED the "STRIKE" key from here so Streamlit doesn't choke on it
-                format_dict = {
-                    "CE OI": "{:,}", "CE Chg": "{:,}", "CE LTP": "{:.2f}",
-                    "PE LTP": "{:.2f}", "PE Chg": "{:,}", "PE OI": "{:,}"
-                }
+                format_dict = {"CE OI": "{:,}", "CE Chg": "{:,}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
+                               "PE Chg": "{:,}", "PE OI": "{:,}"}
 
                 with chain_tabs[0]:
                     if exp_nifty:
@@ -339,9 +520,7 @@ def render_pro_terminal():
                             st.dataframe(df_nifty_filtered.style.format(format_dict).apply(highlight_strike),
                                          width='stretch', height=430, hide_index=True)
                         else:
-                            st.error(
-                                f"No NIFTY strikes found for {sel_exp_nifty}. The exchange may not have generated data for this expiry yet.")
-
+                            st.error("No NIFTY strikes found for this expiry.")
                 with chain_tabs[1]:
                     if exp_bank:
                         sel_exp_bank = st.selectbox("Expiry Date", exp_bank, key="exp_bank")
@@ -350,8 +529,7 @@ def render_pro_terminal():
                             st.dataframe(df_bank_filtered.style.format(format_dict).apply(highlight_strike),
                                          width='stretch', height=430, hide_index=True)
                         else:
-                            st.error(f"No BANKNIFTY strikes found for {sel_exp_bank}.")
-
+                            st.error("No BANKNIFTY strikes found for this expiry.")
                 with chain_tabs[2]:
                     if exp_fin:
                         sel_exp_fin = st.selectbox("Expiry Date", exp_fin, key="exp_fin")
@@ -360,7 +538,7 @@ def render_pro_terminal():
                             st.dataframe(df_fin_filtered.style.format(format_dict).apply(highlight_strike),
                                          width='stretch', height=430, hide_index=True)
                         else:
-                            st.error(f"No FINNIFTY strikes found for {sel_exp_fin}.")
+                            st.error("No FINNIFTY strikes found for this expiry.")
 
             if st.button("Manual Data Refresh"):
                 st.cache_data.clear()
@@ -370,34 +548,46 @@ def render_pro_terminal():
     # PAGE 2: TRADE TERMINAL
     # ==========================================
     elif page == "⚡ Trade Terminal":
+
+        # 1. Calculate the premium currently tied up in open positions
+        open_buy_premium = sum(
+            p['Entry Price'] * p['Quantity'] for p in st.session_state.portfolio if p['Action'] == 'Buy')
+        open_sell_premium = sum(
+            p['Entry Price'] * p['Quantity'] for p in st.session_state.portfolio if p['Action'] == 'Sell')
+
+        # 2. Live Capital = Base Capital + Realized P&L - Premium Paid (Buys) + Premium Collected (Sells)
+        live_available_capital = st.session_state.capital + st.session_state.realized_pnl - open_buy_premium + open_sell_premium
+
         top_col1, top_col2, top_col3 = st.columns([2.5, 1, 1])
 
         with top_col2:
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: #00FF00;'>₹{st.session_state.capital:,.0f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: #1f77b4; font-weight: bold;'>₹{live_available_capital:,.2f}</span></div>",
                 unsafe_allow_html=True)
 
         with top_col3:
             pnl_color = '#00FF00' if st.session_state.realized_pnl > 0 else '#FF0000' if st.session_state.realized_pnl < 0 else 'gray'
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_color};'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_color}; font-weight: bold;'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
                 unsafe_allow_html=True)
 
         st.divider()
-
         col_order, col_portfolio = st.columns([1.6, 2.2])
 
         with col_order:
             st.markdown("#### 📝 Execute Trade")
             with st.container(border=True):
-                tr_records = fetch_nse_option_chain("NIFTY")
+                exec_sym = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], key="exec_sym")
+
+                tr_records = fetch_nse_option_chain(exec_sym)
                 tr_spot = tr_records.get('underlyingValue', 24000.0) if tr_records else 24000.0
-                tr_step = 50
+                tr_step = INDEX_CONFIG[exec_sym]["step"]
+                tr_lot = INDEX_CONFIG[exec_sym]["lot"]
                 tr_nearest = int(round(tr_spot / tr_step) * tr_step)
 
                 c1, c2 = st.columns([1.2, 1])
                 with c1:
-                    strike_prices = list(range(tr_nearest - 1500, tr_nearest + 1550, tr_step))
+                    strike_prices = list(range(tr_nearest - (tr_step * 30), tr_nearest + (tr_step * 31), tr_step))
                     default_index = strike_prices.index(tr_nearest) if tr_nearest in strike_prices else 0
                     selected_strike = st.selectbox("Strike Price", strike_prices, index=default_index)
                 with c2:
@@ -411,8 +601,8 @@ def render_pro_terminal():
 
                 c5, c6 = st.columns(2)
                 with c5:
-                    lots = st.number_input("Lots (65x)", min_value=1, value=1, step=1)
-                    quantity = lots * 65
+                    lots = st.number_input(f"Lots ({tr_lot}x)", min_value=1, value=1, step=1)
+                    quantity = lots * tr_lot
                 with c6:
                     if order_type == "Limit":
                         entry_price = st.number_input("Limit (₹)", min_value=0.0, value=100.0, step=1.0)
@@ -433,17 +623,16 @@ def render_pro_terminal():
                 if st.button("⚡ Execute Trade", use_container_width=True, type="primary"):
                     if order_type == "Market":
                         st.cache_data.clear()
-                        records = fetch_nse_option_chain("NIFTY")
+                        records = fetch_nse_option_chain(exec_sym)
                         live_price = get_ltp_from_chain(records['data'] if records else None, selected_strike,
                                                         option_type)
-
                         if live_price is not None:
                             add_or_average_position(trade_action, selected_strike, option_type, live_price,
-                                                    target_price,
-                                                    sl_price, quantity, live_price)
-                            st.success(f"Executed {trade_action} at ₹{live_price}! (Averaged if position existed)")
+                                                    target_price, sl_price, quantity, live_price)
+                            st.success(
+                                f"Executed {trade_action} at ₹{live_price}! (Averaged/Squared off if applicable)")
                         else:
-                            st.error(f"Failed to fetch Market Price.");
+                            st.error("Failed to fetch Market Price.")
                             st.stop()
                     else:
                         st.session_state.pending_orders.append({
@@ -537,15 +726,19 @@ def render_pro_terminal():
                         for pos in st.session_state.portfolio:
                             c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 1, 1, 1, 1])
                             pnl_color = "#00FF00" if pos['P&L'] > 0 else "#FF0000" if pos['P&L'] < 0 else "gray"
-                            c1.write(f"{pos['Action']}");
-                            c2.write(f"{pos['Quantity']}x {pos['Strike']} {pos['OptType']}")
+                            c1.write(f"{pos['Action']}")
+
+                            sym = "BANKNIFTY" if pos['Strike'] % 100 == 0 and pos['Strike'] % 50 != 0 else "NIFTY"
+                            display_lots = int(pos['Quantity'] / INDEX_CONFIG[sym]["lot"])
+                            c2.write(f"{display_lots} Lot(s) {pos['Strike']} {pos['OptType']}")
+
                             c3.write(f"₹{pos['Entry Price']:.2f}")
                             c4.write(f"₹{pos['Live LTP']:.2f}")
                             c5.markdown(f"<span style='color: {pnl_color}; font-size: 16px;'>₹{pos['P&L']:.2f}</span>",
                                         unsafe_allow_html=True)
-                            if c6.button("🚪 Exit", key=f"btn_{pos['ID']}",
-                                         use_container_width=True): st.session_state.exit_prompt_id = pos[
-                                'ID']; st.rerun()
+                            if c6.button("🚪 Exit", key=f"btn_{pos['ID']}", use_container_width=True):
+                                st.session_state.exit_prompt_id = pos['ID']
+                                st.rerun()
 
                         if st.session_state.exit_prompt_id:
                             pos_to_exit = next(
@@ -556,7 +749,10 @@ def render_pro_terminal():
                                 st.markdown(
                                     f"#### ⚙️ Close Position: {pos_to_exit['Action']} {pos_to_exit['Quantity']}x {pos_to_exit['Strike']} {pos_to_exit['OptType']}")
                                 e_c1, e_c2, e_c3, e_c4 = st.columns(4)
-                                current_lots = int(pos_to_exit['Quantity'] / 65)
+
+                                exit_sym = "BANKNIFTY" if pos_to_exit['Strike'] % 100 == 0 and pos_to_exit[
+                                    'Strike'] % 50 != 0 else "NIFTY"
+                                current_lots = int(pos_to_exit['Quantity'] / INDEX_CONFIG[exit_sym]["lot"])
 
                                 with e_c1:
                                     exit_mode = st.radio("Order Type", ["Market", "Limit"], key="exit_mode")
@@ -570,30 +766,29 @@ def render_pro_terminal():
                                     else:
                                         st.caption("Will execute immediately at Market.")
                                 with e_c4:
-                                    st.write("");
+                                    st.write("")
                                     st.write("")
                                     if st.button("✅ Confirm Exit", type="primary", use_container_width=True):
-                                        qty_to_exit = exit_lots * 65
+                                        qty_to_exit = exit_lots * INDEX_CONFIG[exit_sym]["lot"]
                                         if exit_mode == "Market":
                                             close_position(pos_to_exit['ID'], pos_to_exit['Live LTP'],
-                                                           "Manual Market Exit",
-                                                           qty_to_close=qty_to_exit)
+                                                           "Manual Market Exit", qty_to_close=qty_to_exit)
                                         else:
                                             trigger_dir = ">=" if exit_limit >= pos_to_exit['Live LTP'] else "<="
                                             st.session_state.pending_orders.append({
                                                 "ID": str(uuid.uuid4())[:8], "Pos_ID": pos_to_exit['ID'],
-                                                "Type": "Exit",
-                                                "Action": "Close",
+                                                "Type": "Exit", "Action": "Close",
                                                 "Strike": pos_to_exit['Strike'], "OptType": pos_to_exit['OptType'],
                                                 "Quantity": qty_to_exit, "Limit Price": exit_limit,
                                                 "Trigger": trigger_dir
                                             })
                                             st.toast(f"Pending Exit placed for {qty_to_exit} qty at ₹{exit_limit}")
-                                        st.session_state.exit_prompt_id = None;
+                                        st.session_state.exit_prompt_id = None
                                         st.rerun()
 
-                                    if st.button("❌ Cancel", key="cancel_exit_prompt",
-                                                 use_container_width=True): st.session_state.exit_prompt_id = None; st.rerun()
+                                    if st.button("❌ Cancel", key="cancel_exit_prompt", use_container_width=True):
+                                        st.session_state.exit_prompt_id = None
+                                        st.rerun()
                         st.markdown("---")
 
                         if total_unrealized_pnl > 0:
@@ -608,26 +803,22 @@ def render_pro_terminal():
             with tab2:
                 if len(st.session_state.pending_orders) > 0:
                     h1, h2, h3, h4, h5, h6 = st.columns([1, 1.5, 1, 1.2, 0.8, 0.8])
-                    h1.markdown("Type");
-                    h2.markdown("Contract");
-                    h3.markdown("Limit Price");
-                    h4.markdown("Target / SL");
-                    h5.markdown("Edit");
+                    h1.markdown("Type")
+                    h2.markdown("Contract")
+                    h3.markdown("Limit Price")
+                    h4.markdown("Target / SL")
+                    h5.markdown("Edit")
                     h6.markdown("Cancel")
                     st.markdown("---")
-
                     for po in st.session_state.pending_orders:
                         c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 1, 1.2, 0.8, 0.8])
-                        c1.write(f"{po['Type']} Limit");
-                        c2.write(f"{po['Quantity']}x {po['Strike']} {po['OptType']}");
+                        c1.write(f"{po['Type']} Limit")
+                        c2.write(f"{po['Quantity']}x {po['Strike']} {po['OptType']}")
                         c3.write(f"₹{po['Limit Price']:.2f}")
-                        if po['Type'] == "Entry":
-                            c4.write(f"T: {po['Target']} / SL: {po['SL']}")
-                        else:
-                            c4.write("-")
-
-                        if c5.button("✏️ Edit", key=f"edit_po_{po['ID']}",
-                                     use_container_width=True): st.session_state.edit_prompt_id = po['ID']; st.rerun()
+                        c4.write(f"T: {po['Target']} / SL: {po['SL']}" if po['Type'] == "Entry" else "-")
+                        if c5.button("✏️ Edit", key=f"edit_po_{po['ID']}", use_container_width=True):
+                            st.session_state.edit_prompt_id = po['ID']
+                            st.rerun()
                         if c6.button("❌ Cancel", key=f"cancel_po_{po['ID']}", use_container_width=True):
                             st.session_state.pending_orders.remove(po)
                             if st.session_state.edit_prompt_id == po['ID']: st.session_state.edit_prompt_id = None
@@ -635,10 +826,8 @@ def render_pro_terminal():
 
                     st.markdown("---")
                     if st.session_state.edit_prompt_id:
-                        po_to_edit = next(
-                            (po for po in st.session_state.pending_orders if
-                             po['ID'] == st.session_state.edit_prompt_id),
-                            None)
+                        po_to_edit = next((po for po in st.session_state.pending_orders if
+                                           po['ID'] == st.session_state.edit_prompt_id), None)
                         if po_to_edit:
                             st.markdown(
                                 f"#### ✏️ Modify Order: {po_to_edit['Type']} {po_to_edit['Quantity']}x {po_to_edit['Strike']} {po_to_edit['OptType']}")
@@ -652,11 +841,11 @@ def render_pro_terminal():
                                 else:
                                     st.caption("Will execute immediately at live Market price.")
                             with e_c3:
-                                st.write("");
+                                st.write("")
                                 st.write("")
                                 if st.button("✅ Confirm Update", type="primary", use_container_width=True):
                                     if edit_mode == "Limit":
-                                        po_to_edit['Limit Price'] = new_limit;
+                                        po_to_edit['Limit Price'] = new_limit
                                         st.toast(f"Pending Order updated to Limit ₹{new_limit}")
                                     else:
                                         live_price = get_ltp_from_chain(chain_data, po_to_edit['Strike'],
@@ -675,13 +864,14 @@ def render_pro_terminal():
                                             st.session_state.pending_orders.remove(po_to_edit)
                                         else:
                                             st.error("Could not fetch Live Price for Market execution.")
-                                    st.session_state.edit_prompt_id = None;
+                                    st.session_state.edit_prompt_id = None
                                     st.rerun()
 
-                                if st.button("❌ Close Editor",
-                                             use_container_width=True): st.session_state.edit_prompt_id = None; st.rerun()
+                                if st.button("❌ Close Editor", use_container_width=True):
+                                    st.session_state.edit_prompt_id = None
+                                    st.rerun()
                 else:
-                    st.info("No pending orders.");
+                    st.info("No pending orders.")
                     st.session_state.edit_prompt_id = None
 
             with tab3:
@@ -698,7 +888,6 @@ def render_pro_terminal():
 
                     st.dataframe(formatted_hist, width='stretch', hide_index=True)
 
-                    if st.button("🗑️ Clear History"): st.session_state.history = []; st.rerun()
                 else:
                     st.info("No closed trades yet.")
 
@@ -706,22 +895,19 @@ def render_pro_terminal():
                 if len(st.session_state.portfolio) > 0 and spot_price > 0:
                     spot_range = list(range(int(spot_price) - 1000, int(spot_price) + 1000, 50))
                     payoffs = []
-
                     for s in spot_range:
                         pnl_at_expiry = 0
                         for pos in st.session_state.portfolio:
-                            strike = pos['Strike'];
-                            entry = pos['Entry Price'];
+                            strike = pos['Strike']
+                            entry = pos['Entry Price']
                             qty = pos['Quantity']
                             val = max(0, s - strike) if pos['OptType'] == 'CE' else max(0, strike - s)
                             pnl_at_expiry += (val - entry) * qty if pos['Action'] == 'Buy' else (entry - val) * qty
                         payoffs.append(pnl_at_expiry)
 
                     fig = go.Figure()
-                    fig.add_trace(
-                        go.Scatter(x=spot_range, y=payoffs, mode='lines', line=dict(color='red', width=3),
-                                   fill='tozeroy',
-                                   fillcolor='rgba(255, 0, 0, 0.1)'))
+                    fig.add_trace(go.Scatter(x=spot_range, y=payoffs, mode='lines', line=dict(color='red', width=3),
+                                             fill='tozeroy', fillcolor='rgba(255, 0, 0, 0.1)'))
                     fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
                                       xaxis_title="Nifty Spot Price", yaxis_title="Profit / Loss (₹)",
                                       margin=dict(l=20, r=20, t=30, b=20), font=dict(color='white'),
@@ -732,18 +918,24 @@ def render_pro_terminal():
                     fig.add_hline(y=0, line_dash="dash", line_color="black")
                     st.plotly_chart(fig, use_container_width=True)
 
-                    max_profit = max(payoffs);
+                    max_profit = max(payoffs)
                     max_loss = min(payoffs)
                     prof_text = "Unlimited" if (max_profit == payoffs[0] and payoffs[0] > payoffs[1]) or (
                             max_profit == payoffs[-1] and payoffs[-1] > payoffs[-2]) else f"₹{max_profit:,.2f}"
                     loss_text = "Unlimited" if (max_loss == payoffs[0] and payoffs[0] < payoffs[1]) or (
                             max_loss == payoffs[-1] and payoffs[-1] < payoffs[-2]) else f"₹{max_loss:,.2f}"
 
-                    st.markdown("---");
+                    st.markdown("---")
                     m1, m2 = st.columns(2)
-                    m1.success(f"**🟢 Max Profit:** {prof_text}");
+                    m1.success(f"**🟢 Max Profit:** {prof_text}")
                     m2.error(f"**🔴 Max Loss:** {loss_text}")
                     st.caption(
                         "Chart assumes positions are held to expiry day. Max Profit/Loss are estimated based on a ±1000 point range.")
                 else:
                     st.info("Execute trades and fetch live data to view your payoff chart.")
+
+
+if __name__ == "__main__":
+    st.set_page_config(page_title="Options Pro Terminal", layout="wide", page_icon="📈")
+    # Make sure your login flow logic is added back down here if you use it!
+    render_pro_terminal()

@@ -108,17 +108,18 @@ def render_signup_page():
 
 # --- Router ---
 def render_auth_page():
-    # Initialize database when auth page is rendered
-    init_db()
-    
-    st.markdown("<h1 style='text-align: center; color: #1f77b4;'>📈 Options Pro</h1>", unsafe_allow_html=True)
-    
     # Centering the radio buttons using columns
     col1, col2, col3 = st.columns([1, 1.5, 1])
     with col2:
-        option = st.radio("Select Action", ["Login", "Signup"], horizontal=True)
+        option = st.radio("Select Action", ["Login", "Signup"], horizontal=True, key="auth_action_radio")
 
     if option == "Login":
         render_login_page()
     else:
         render_signup_page()
+
+
+# --- Main ---
+# Initialize the database table structure
+init_db()
+
