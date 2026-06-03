@@ -2,9 +2,15 @@ import streamlit as st
 import login
 import terminal  # We are importing your newly renamed terminal.py here
 
+
+def load_css():
+    with open("style.css") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+
+
 # Set page config here so it applies to the whole app layout
 st.set_page_config(page_title="Options Pro", page_icon="📈", layout="wide")
-
+load_css() # <--- Loads your gorgeous new CSS!
 # Force the database to initialize and create any missing tables!
 login.init_db()
 

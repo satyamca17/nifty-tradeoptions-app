@@ -8,6 +8,12 @@ from datetime import datetime
 from jugaad_data.nse import NSELive
 from streamlit_autorefresh import st_autorefresh
 
+
+def load_css():
+    with open("style.css") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+
+
 # --- CONFIG ---
 DB_PATH = "users.db"
 INDEX_CONFIG = {
@@ -297,16 +303,7 @@ def close_position(pos_id, exit_price, reason="Manual Square-off", qty_to_close=
 # MAIN TERMINAL RENDER FUNCTION
 # ==========================================
 def render_pro_terminal():
-    st.markdown("""
-        <style>
-        .block-container { padding-top: 1.5rem !important; }
-        div[data-testid="stMetricValue"] { font-size: 22px !important; font-weight: 700 !important; color: #1f77b4 !important; }
-        div[data-testid="stMetricLabel"] { font-size: 13px !important; font-weight: 600 !important; color: #555555 !important; }
-        div[data-testid="stMetricDelta"] { font-size: 13px !important; }
-        div[role="radiogroup"] { display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; gap: 15px !important; justify-content: center; }
-        div[role="radiogroup"] > label { white-space: nowrap !important; }
-        </style>
-        """, unsafe_allow_html=True)
+    load_css()
 
     # DATABASE LOAD (Runs once per session)
     if 'db_loaded' not in st.session_state:
@@ -331,24 +328,20 @@ def render_pro_terminal():
         st.toast(f"{icon} {action} {lots_count} Lot(s) of {contract_name} at Market!")
         st.session_state.main_nav_radio = "⚡ Trade Terminal"
 
-    # --- UPDATED HEADER WITH USER PROFILE DROPDOWN ---
-    h_col_title, h_col_user = st.columns([8.5, 1.5])
+    # --- TIGHTENED HEADER WITH USER PROFILE DROPDOWN ---
+    h_col_title, h_col_user = st.columns([9.3, 0.7])  # Squeezed user column to save space
 
     with h_col_title:
         st.markdown("<h2 style='text-align: center; margin-bottom: 5px;'>📈 Options Pro Terminal</h2>",
                     unsafe_allow_html=True)
 
     with h_col_user:
-        st.write("")  # Tiny spacer to vertically align the button with the title
+        st.write("")
 
-        # Dynamically grabs the logged-in username and capitalizes it
         current_user = st.session_state.get('username', 'User').capitalize()
 
-        # Creates a dropdown profile menu
         with st.popover(f"👤 {current_user}", use_container_width=True):
             st.caption(f"Logged in as **{current_user}**")
-
-            # The logout button is now safely tucked inside the menu
             if st.button("🚪 Logout", type="primary", use_container_width=True):
                 st.session_state.authenticated = False
                 if 'db_loaded' in st.session_state: del st.session_state['db_loaded']
@@ -495,7 +488,6 @@ def render_pro_terminal():
                                                                    label_visibility="collapsed")
                                     trade_qty = num_lots * lot_size
 
-                                    # Used Streamlit callbacks to safely switch tabs!
                                     cc3.button("Buy", key=f"buy_{current_wl}_{item_idx}", type="primary",
                                                use_container_width=True, on_click=quick_execute,
                                                args=("Buy", strike, opt_type, item["LTP"], trade_qty, item['Contract'],
@@ -519,7 +511,7 @@ def render_pro_terminal():
                 chain_tabs = st.tabs(["NIFTY", "BANKNIFTY", "FINNIFTY"])
 
                 def highlight_strike(s):
-                    return ['background-color: #f0f2f6; font-weight: bold; color: black' if s.name == 'STRIKE' else ''
+                    return ['background-color: #1e222d; font-weight: bold; color: #d1d4dc' if s.name == 'STRIKE' else ''
                             for v in s]
 
                 format_dict = {"CE OI": "{:,}", "CE Chg": "{:,}", "CE LTP": "{:.2f}", "PE LTP": "{:.2f}",
@@ -571,17 +563,18 @@ def render_pro_terminal():
         # 2. Live Capital = Base Capital + Realized P&L - Premium Paid (Buys) + Premium Collected (Sells)
         live_available_capital = st.session_state.capital + st.session_state.realized_pnl - open_buy_premium + open_sell_premium
 
-        top_col1, top_col2, top_col3 = st.columns([2.5, 1, 1])
+        # Compact Capital & P&L text
+        top_col1, top_col2, top_col3 = st.columns([3.5, 0.8, 0.8])
 
         with top_col2:
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Available Capital</span><br><span style='font-size: 24px; color: #1f77b4; font-weight: bold;'>₹{live_available_capital:,.2f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 11px; font-weight: bold; color: #787b86; text-transform: uppercase;'>Available Capital</span><br><span style='font-size: 16px; color: #2962ff; font-weight: bold;'>₹{live_available_capital:,.2f}</span></div>",
                 unsafe_allow_html=True)
 
         with top_col3:
-            pnl_color = '#00FF00' if st.session_state.realized_pnl > 0 else '#FF0000' if st.session_state.realized_pnl < 0 else 'gray'
+            pnl_color = '#00FF00' if st.session_state.realized_pnl > 0 else '#ff4b4b' if st.session_state.realized_pnl < 0 else '#787b86'
             st.markdown(
-                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 16px; font-weight: bold; color: gray;'>Realized P&L</span><br><span style='font-size: 24px; color: {pnl_color}; font-weight: bold;'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
+                f"<div style='text-align: right; margin-top: 5px;'><span style='font-size: 11px; font-weight: bold; color: #787b86; text-transform: uppercase;'>Realized P&L</span><br><span style='font-size: 16px; color: {pnl_color}; font-weight: bold;'>₹{st.session_state.realized_pnl:,.2f}</span></div>",
                 unsafe_allow_html=True)
 
         st.divider()
@@ -692,11 +685,12 @@ def render_pro_terminal():
                 ["💼 Open Positions", "⏳ Pending Orders", "📜 Trade History", "📊 Expiry Payoff Chart"])
 
             with tab1:
-                rc1, rc2 = st.columns([3, 1])
+                # Shrink the Refresh Button container
+                rc1, rc2 = st.columns([6, 1])
                 with rc1:
                     st.markdown(f"#### **Live NIFTY 50 Spot:** `{spot_price}`")
                 with rc2:
-                    if st.button("🔄 Refresh Data", use_container_width=True): st.cache_data.clear(); st.rerun()
+                    if st.button("🔄 Refresh", use_container_width=True): st.cache_data.clear(); st.rerun()
 
                 if len(st.session_state.portfolio) > 0 and chain_data:
                     total_unrealized_pnl = 0.0
@@ -727,7 +721,8 @@ def render_pro_terminal():
 
                     if len(st.session_state.portfolio) > 0:
                         st.markdown("---")
-                        h1, h2, h3, h4, h5, h6 = st.columns([1, 1.5, 1, 1, 1, 1])
+                        # Adjusted the last column width from 1 to 0.6
+                        h1, h2, h3, h4, h5, h6 = st.columns([1, 1.5, 1, 1, 1, 0.6])
                         h1.markdown("Action")
                         h2.markdown("Contract")
                         h3.markdown("Avg Price")
@@ -737,7 +732,8 @@ def render_pro_terminal():
                         st.markdown("---")
 
                         for pos in st.session_state.portfolio:
-                            c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 1, 1, 1, 1])
+                            # Tightly squeezed row layout!
+                            c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 1, 1, 1, 0.6])
                             pnl_color = "#00FF00" if pos['P&L'] > 0 else "#FF0000" if pos['P&L'] < 0 else "gray"
                             c1.write(f"{pos['Action']}")
 
@@ -946,7 +942,6 @@ def render_pro_terminal():
                         "Chart assumes positions are held to expiry day. Max Profit/Loss are estimated based on a ±1000 point range.")
                 else:
                     st.info("Execute trades and fetch live data to view your payoff chart.")
-
 
 if __name__ == "__main__":
     st.set_page_config(page_title="Options Pro Terminal", layout="wide", page_icon="📈")
